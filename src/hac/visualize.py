@@ -132,6 +132,72 @@ def plot_optimization_loss(
     plt.close(fig)
 
 
+VOXEL_MEASURE_LABELS: tuple[str, str] = (
+    "Measure 1: 1 - |A∩B| / |A∪B|",
+    "Measure 2: (|A\\B| + |B\\A|) / (|A| + |B|)",
+)
+
+
+def plot_voxel_measures(
+    iterations: ArrayLike,
+    measure1: ArrayLike,
+    measure2: ArrayLike,
+    output_path: str | PathLike[str],
+    *,
+    title: str = "Voxel volume difference against the reference shape",
+    dpi: int = 160,
+) -> None:
+    """Plot both FIPS voxel volume-difference measures against the iteration count.
+
+    The minimum of each curve is marked and annotated: lower is closer to the
+    reference shape, and the best-scoring iteration is rarely the last one.
+    """
+    steps = _loss_vector("iterations", iterations)
+    first = _loss_vector("measure1", measure1)
+    second = _loss_vector("measure2", measure2)
+    if first.shape != steps.shape or second.shape != steps.shape:
+        raise ValueError(
+            "iterations, measure1, and measure2 must have the same length; "
+            f"got {steps.shape}, {first.shape}, and {second.shape}."
+        )
+    if dpi <= 0:
+        raise ValueError(f"dpi must be positive; got {dpi}.")
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for values, label, color in zip(
+        (first, second),
+        VOXEL_MEASURE_LABELS,
+        ("tab:blue", "tab:orange"),
+        strict=True,
+    ):
+        ax.plot(steps, values, label=label, color=color, marker=".", markersize=4)
+        best_index = int(np.argmin(values))
+        ax.scatter(
+            steps[best_index],
+            values[best_index],
+            color=color,
+            marker="*",
+            s=140,
+            zorder=3,
+            label=(
+                f"best {values[best_index]:.4f} @ iteration {int(steps[best_index])}"
+            ),
+        )
+    ax.set(
+        xlabel="Iteration",
+        ylabel="Relative volume difference",
+        title=title,
+    )
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output, dpi=dpi)
+    plt.close(fig)
+
+
 def _curve_matrix(name: str, values: ArrayLike) -> NDArray[np.float64]:
     array = np.asarray(values, dtype=np.float64)
     if array.ndim != 2 or 0 in array.shape:

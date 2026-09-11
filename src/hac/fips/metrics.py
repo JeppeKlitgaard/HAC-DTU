@@ -9,12 +9,22 @@ def load_as_trimesh(mshfile):
 
 
 def relative_volume_difference_voxelized(meshname1, meshname2, pitch=10):
+    """Either argument may be a mesh file path or an already-loaded trimesh.
 
-    A = load_as_trimesh(meshname1)
-    if isinstance(meshname2, str):
-        B = load_as_trimesh(meshname2)
-    else:
-        B = meshname2
+    Passing a loaded mesh matters when one side is reused across many calls: the
+    file read dominates the runtime for a dense reference shape.
+    """
+
+    A = (
+        meshname1
+        if isinstance(meshname1, trimesh.Trimesh)
+        else load_as_trimesh(meshname1)
+    )
+    B = (
+        meshname2
+        if isinstance(meshname2, trimesh.Trimesh)
+        else load_as_trimesh(meshname2)
+    )
 
     # -------------------------------------------------------
     # 1. Compute shared bounding box min/max

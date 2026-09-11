@@ -5,6 +5,10 @@ Only supports the `direct` integrator (orthographic assumption).
 Optional progressive refinement: --remesh-level N (up to N loss-triggered
 Botsch-Kobbelt remeshes) or --remesh-interval K (remesh every K iterations);
 needs gpytoolbox.
+
+For models 1-3 the ground-truth shape is public, so the FIPS voxel volume
+difference measures are tracked at every validation check and plotted against
+the iteration count (disable with --no-voxel-metrics).
 """
 
 import argparse
@@ -37,6 +41,10 @@ _REMESH_ADAPTIVE_WINDOW = 20  # iterations of loss history judged for stagnation
 _REMESH_ADAPTIVE_MIN_IMPROVEMENT = 0.02  # relative loss gain below which we remesh
 _REMESH_ADAPTIVE_COOLDOWN = 20  # minimum iterations between adaptive remeshes
 
+# The ground-truth shape ships only for these models, so the voxel measures
+# against it can only be evaluated there.
+_KNOWN_SHAPE_MAX_MODEL = 3
+
 
 @dataclass(frozen=True, slots=True)
 class RunConfiguration:
@@ -64,6 +72,8 @@ class RunConfiguration:
     checkpoint_interval: int
     reduction_temperature: float
     evaluate_reference: bool
+    voxel_metrics: bool
+    voxel_pitch_divisor: float
     render_movies: bool
     movie_observer: str
     movie_phases: int
@@ -78,6 +88,11 @@ class RunConfiguration:
     @property
     def data_sources(self) -> tuple[DataSource, ...]:
         return (self.data_source,)
+
+    @property
+    def voxel_metrics_enabled(self) -> bool:
+        """Voxel measures need the reference shape, which is public for models 1-3."""
+        return self.voxel_metrics and self.model_num <= _KNOWN_SHAPE_MAX_MODEL
 
     @property
     def remesh_enabled(self) -> bool:
@@ -103,6 +118,7 @@ class RunPaths:
     curves: Path
     lightcurve_plot: Path
     loss_plot: Path
+    voxel_plot: Path
     initial_views: Path
     best_views: Path
     reference_views: Path
@@ -126,6 +142,7 @@ class RunPaths:
             curves=output_dir / "curves.npz",
             lightcurve_plot=output_dir / "lightcurve_fit.png",
             loss_plot=output_dir / "optimization_loss.png",
+            voxel_plot=output_dir / "voxel_measures.png",
             initial_views=output_dir / "initial_views.png",
             best_views=output_dir / "best_views.png",
             reference_views=output_dir / "reference_views.png",
@@ -219,6 +236,25 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
     )
     parser.add_argument("--reduction-temperature", type=float, default=0.01)
     parser.add_argument("--evaluate-reference", action="store_true")
+    parser.add_argument(
+        "--no-voxel-metrics",
+        dest="voxel_metrics",
+        action="store_false",
+        help=(
+            "skip the FIPS voxel volume difference against the reference shape; "
+            f"it is tracked at every validation check for models 1-"
+            f"{_KNOWN_SHAPE_MAX_MODEL} and ignored for the secret models"
+        ),
+    )
+    parser.add_argument(
+        "--voxel-pitch-divisor",
+        type=float,
+        default=40.0,
+        help=(
+            "voxel pitch for the voxel measures, as the model's challenge cylinder "
+            "radius divided by this value (higher is finer and slower)"
+        ),
+    )
     parser.add_argument("--render-movies", action="store_true")
     parser.add_argument("--movie-observer", default="0_hor1")
     parser.add_argument("--movie-phases", type=int, default=360)
@@ -264,7 +300,12 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
         "movie_fps",
     ):
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
-    for name in ("learning_rate", "large_steps_lambda", "reduction_temperature"):
+    for name in (
+        "learning_rate",
+        "large_steps_lambda",
+        "reduction_temperature",
+        "voxel_pitch_divisor",
+    ):
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
     if args.spp_grad < 0:
         parser.error("--spp-grad must be non-negative")
@@ -310,6 +351,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
         checkpoint_interval=args.checkpoint_interval,
         reduction_temperature=args.reduction_temperature,
         evaluate_reference=args.evaluate_reference,
+        voxel_metrics=args.voxel_metrics,
+        voxel_pitch_divisor=args.voxel_pitch_divisor,
         render_movies=args.render_movies,
         movie_observer=args.movie_observer,
         movie_phases=args.movie_phases,
@@ -621,6 +664,40 @@ def _export_mesh(path: Path, positions: np.ndarray, faces: np.ndarray) -> None:
     trimesh.Trimesh(vertices=positions, faces=faces, process=False).export(path)
 
 
+def _voxel_measures(
+    reference_mesh: trimesh.Trimesh,
+    positions: np.ndarray,
+    faces: np.ndarray,
+    *,
+    pitch: float,
+) -> tuple[float, float]:
+    """FIPS voxel volume difference between the current shape and the reference.
+
+    Both measures are zero for identical shapes and grow towards 1 as the shapes
+    diverge. The reference is passed in already loaded: re-reading a dense STL
+    dominates the runtime of the metric otherwise.
+    """
+    from hac.fips.metrics import relative_volume_difference_voxelized
+
+    measure1, measure2 = relative_volume_difference_voxelized(
+        reference_mesh,
+        trimesh.Trimesh(vertices=positions, faces=faces, process=False),
+        pitch=pitch,
+    )
+    return float(measure1), float(measure2)
+
+
+def _best_voxel_measure(
+    history: Sequence[Mapping[str, Any]],
+    key: str,
+) -> dict[str, Any] | None:
+    """Lowest (best) entry of ``history`` for one measure, with its iteration."""
+    if not history:
+        return None
+    best = min(history, key=lambda entry: entry[key])
+    return {"iteration": best["iteration"], "value": best[key]}
+
+
 def _apply_optimizer_positions(
     forward,
     optimizer,
@@ -834,7 +911,11 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
     from hac.data import get_model_stl_path, prepare_lightcurve_targets
     from hac.mesh import normalize_mesh_to_challenge_cylinder
     from hac.mitsuba.scene import DEFAULT_BSDF
-    from hac.visualize import plot_lightcurve_comparison, plot_optimization_loss
+    from hac.visualize import (
+        plot_lightcurve_comparison,
+        plot_optimization_loss,
+        plot_voxel_measures,
+    )
 
     output_dir = _resolve_output_dir(configuration)
     paths = RunPaths.from_output_dir(output_dir)
@@ -867,10 +948,31 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
             "projection": PROJECTION,
             "integrator": INTEGRATOR,
             "frozen_training": freeze_training,
+            "voxel_metrics_enabled": configuration.voxel_metrics_enabled,
         },
     )
     initial_mesh = _prepare_initial_mesh(configuration, cylinder_radius)
     initial_mesh.export(paths.initial_mesh)
+
+    # The reference shape is needed up front for the voxel measures, and reused
+    # by --evaluate-reference below rather than being loaded a second time. It is
+    # only written out for --evaluate-reference, which renders it from a file; the
+    # voxel measures work off the in-memory mesh and the STL is tens of megabytes.
+    reference_mesh: trimesh.Trimesh | None = None
+    reference_stl_path: Path | None = None
+    if configuration.voxel_metrics_enabled or configuration.evaluate_reference:
+        reference_stl_path = get_model_stl_path(configuration.model_num)
+        reference_mesh = normalize_mesh_to_challenge_cylinder(
+            trimesh.load_mesh(reference_stl_path, force="mesh"),
+            target_R=cylinder_radius,
+        )
+        if configuration.evaluate_reference:
+            reference_mesh.export(paths.normalized_reference_mesh)
+    voxel_pitch = (
+        cylinder_radius / configuration.voxel_pitch_divisor
+        if configuration.voxel_metrics_enabled
+        else None
+    )
 
     forward, faces, large_steps, optimizer = _build_optimization_state(
         paths.initial_mesh, configuration, n_phases=n_phases
@@ -920,19 +1022,36 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
     validation_history: list[dict[str, Any]] = [
         {"iteration": 0, "loss": initial_loss}
     ]
+    voxel_history: list[dict[str, Any]] = []
     validation_checks_without_improvement = 0
     iterations_completed = 0
 
-    with paths.history.open("w") as history_file:
-        _append_history(
-            history_file,
-            {
-                "kind": "validation",
-                "iteration": 0,
-                "loss": initial_loss,
-                "best": True,
-            },
+    initial_entry: dict[str, Any] = {
+        "kind": "validation",
+        "iteration": 0,
+        "loss": initial_loss,
+        "best": True,
+    }
+    if voxel_pitch is not None:
+        assert reference_mesh is not None
+        measure1, measure2 = _voxel_measures(
+            reference_mesh,
+            best_positions,
+            best_faces,
+            pitch=voxel_pitch,
         )
+        voxel_history.append(
+            {"iteration": 0, "measure1": measure1, "measure2": measure2}
+        )
+        initial_entry["voxel_measure1"] = measure1
+        initial_entry["voxel_measure2"] = measure2
+        print(
+            f"Initial shape: voxel_measure1={measure1:.6f}, "
+            f"voxel_measure2={measure2:.6f} (pitch={voxel_pitch:.4g})"
+        )
+
+    with paths.history.open("w") as history_file:
+        _append_history(history_file, initial_entry)
         for iteration in range(1, configuration.iterations + 1):
             positions = _apply_optimizer_positions(
                 forward,
@@ -1010,7 +1129,7 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
                     validation_checks_without_improvement = 0
                 else:
                     validation_checks_without_improvement += 1
-                validation_entry = {
+                validation_entry: dict[str, Any] = {
                     "kind": "validation",
                     "iteration": iteration,
                     "loss": validation_loss,
@@ -1019,10 +1138,31 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
                 validation_history.append(
                     {"iteration": iteration, "loss": validation_loss}
                 )
-                _append_history(history_file, validation_entry)
                 print(
                     f"  validation_loss={validation_loss:.8f}, best={improved}"
                 )
+                if voxel_pitch is not None:
+                    assert reference_mesh is not None
+                    measure1, measure2 = _voxel_measures(
+                        reference_mesh,
+                        _positions_numpy(forward),
+                        faces,
+                        pitch=voxel_pitch,
+                    )
+                    voxel_history.append(
+                        {
+                            "iteration": iteration,
+                            "measure1": measure1,
+                            "measure2": measure2,
+                        }
+                    )
+                    validation_entry["voxel_measure1"] = measure1
+                    validation_entry["voxel_measure2"] = measure2
+                    print(
+                        f"  voxel_measure1={measure1:.6f}, "
+                        f"voxel_measure2={measure2:.6f}"
+                    )
+                _append_history(history_file, validation_entry)
                 if (
                     configuration.early_stop_patience > 0
                     and validation_checks_without_improvement
@@ -1117,12 +1257,7 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
     reference_loss = None
     reference_available = False
     if configuration.evaluate_reference:
-        reference_path = get_model_stl_path(configuration.model_num)
-        reference_mesh = normalize_mesh_to_challenge_cylinder(
-            trimesh.load_mesh(reference_path, force="mesh"),
-            target_R=cylinder_radius,
-        )
-        reference_mesh.export(paths.normalized_reference_mesh)
+        assert reference_mesh is not None  # prepared before the optimization loop
         reference_forward = _build_forward(
             paths.normalized_reference_mesh,
             configuration,
@@ -1169,6 +1304,28 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
             "Reference-shape forward MSE" if reference_loss is not None else None
         ),
     )
+    best_voxel_measure1 = _best_voxel_measure(voxel_history, "measure1")
+    best_voxel_measure2 = _best_voxel_measure(voxel_history, "measure2")
+    if voxel_history:
+        plot_voxel_measures(
+            [entry["iteration"] for entry in voxel_history],
+            [entry["measure1"] for entry in voxel_history],
+            [entry["measure2"] for entry in voxel_history],
+            paths.voxel_plot,
+            title=(
+                f"Model {configuration.model_num}: voxel volume difference "
+                f"(pitch={voxel_pitch:.4g})"
+            ),
+        )
+        for label, best in (
+            ("measure1", best_voxel_measure1),
+            ("measure2", best_voxel_measure2),
+        ):
+            assert best is not None
+            print(
+                f"Best voxel {label}={best['value']:.6f} "
+                f"at iteration {best['iteration']}"
+            )
     np.savez_compressed(
         paths.curves,
         target=targets,
@@ -1226,6 +1383,28 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
         "final_validation_loss": final_loss,
         "checkpoint_reconstruction": checkpoint_reconstruction,
         "reference_loss": reference_loss,
+        "voxel_metrics": {
+            "enabled": configuration.voxel_metrics_enabled,
+            "pitch": voxel_pitch,
+            "pitch_divisor": configuration.voxel_pitch_divisor,
+            # Normalized to the challenge cylinder in memory, exactly as the
+            # optimized shape is, so the two are compared in the same frame.
+            "reference_stl": (
+                str(reference_stl_path) if voxel_pitch is not None else None
+            ),
+            "best_measure1": best_voxel_measure1,
+            "best_measure2": best_voxel_measure2,
+            # The lowest-loss shape is not necessarily the closest one by volume.
+            "at_best_loss_iteration": next(
+                (
+                    entry
+                    for entry in voxel_history
+                    if entry["iteration"] == best_iteration
+                ),
+                None,
+            ),
+            "history": voxel_history,
+        },
         "training_loss_history": training_losses,
         "validation_history": validation_history,
         "binary_thresholds": (
@@ -1251,6 +1430,7 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
             "curves": str(paths.curves),
             "lightcurve_plot": str(paths.lightcurve_plot),
             "loss_plot": str(paths.loss_plot),
+            "voxel_plot": str(paths.voxel_plot) if voxel_history else None,
             "initial_views": str(paths.initial_views),
             "best_views": str(paths.best_views),
             "reference_mesh": (
