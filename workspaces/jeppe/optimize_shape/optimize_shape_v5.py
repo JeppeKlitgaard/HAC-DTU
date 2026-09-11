@@ -158,7 +158,11 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
     parser.add_argument(
         "--initial-mesh",
         type=Path,
-        help="optional warm-start mesh; otherwise construct an ellipsoid",
+        help=(
+            "optional warm-start mesh; otherwise construct an ellipsoid. Either "
+            "way the result is resampled to --initial-face-count and normalized "
+            "to the challenge cylinder"
+        ),
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
@@ -195,8 +199,18 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
         default=0,
         help="validation checks without improvement; 0 disables early stopping",
     )
-    parser.add_argument("--initial-subdivisions", type=int, default=5)
-    parser.add_argument("--initial-face-count", type=int, default=2_500)
+    parser.add_argument(
+        "--initial-subdivisions",
+        type=int,
+        default=5,
+        help="icosphere detail for the generated ellipsoid; unused with --initial-mesh",
+    )
+    parser.add_argument(
+        "--initial-face-count",
+        type=int,
+        default=2_500,
+        help="face budget the initial mesh is resampled to, warm starts included",
+    )
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
@@ -410,6 +424,57 @@ def _should_remesh(
     return relative_improvement < _REMESH_ADAPTIVE_MIN_IMPROVEMENT
 
 
+def _resample_to_face_count(
+    mesh: trimesh.Trimesh,
+    face_count: int,
+) -> trimesh.Trimesh:
+    """Bring ``mesh`` to approximately ``face_count`` triangles.
+
+    Loop-subdivide (~4x faces per pass) while the mesh is coarser than the
+    target, then quadric-decimate down onto it. Both halves are no-ops for a
+    mesh that already sits at ``face_count``, so this is safe to apply
+    unconditionally.
+
+    The optimizer's face budget is a deliberate choice - coarse starts let
+    --remesh-level add detail only where the loss asks for it - so warm-start
+    meshes are held to it just like the generated ellipsoid.
+
+    Decimating onto a count that is not a clean subdivision of the source can
+    leave holes: trimesh's quadric decimation is not manifold-preserving, and the
+    subdivide-then-decimate path (face_count above the source density) is the
+    usual way to hit that. A non-watertight start is warned about below rather
+    than rejected - the Large Steps parameterization still runs on it, but the
+    solve is better behaved on a closed surface.
+    """
+    was_watertight = mesh.is_watertight
+    source_face_count = len(mesh.faces)
+
+    while len(mesh.faces) < face_count:
+        mesh = mesh.subdivide()
+    subdivided_face_count = len(mesh.faces)
+    if len(mesh.faces) > face_count:
+        mesh = mesh.simplify_quadric_decimation(face_count=face_count)
+
+    if was_watertight and not mesh.is_watertight:
+        upsampled = subdivided_face_count > source_face_count
+        warnings.warn(
+            f"Resampling {source_face_count} faces to {face_count} produced a "
+            "non-watertight mesh (quadric decimation is not manifold-preserving)"
+            + (
+                f"; --initial-face-count is above the source density, so the mesh "
+                f"was subdivided to {subdivided_face_count} faces first and then "
+                "decimated back down, which is the step that tends to open holes. "
+                "Lowering --initial-face-count to at or below the source density "
+                "avoids it, as does letting --remesh-level add the detail instead."
+                if upsampled
+                else ". Try a face count closer to the source density."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return mesh
+
+
 def _prepare_initial_mesh(
     configuration: RunConfiguration,
     cylinder_radius: float,
@@ -426,16 +491,15 @@ def _prepare_initial_mesh(
             )
         mesh = trimesh.load_mesh(configuration.initial_mesh, force="mesh")
     else:
+        # --initial-subdivisions only shapes the generated icosphere; a
+        # warm-start mesh arrives with whatever tessellation it was built with.
         mesh = construct_initial_ellipsoid_mesh(
             radius=cylinder_radius,
             subdivisions=configuration.initial_subdivisions,
         )
-        if len(mesh.faces) > configuration.initial_face_count:
-            mesh = mesh.simplify_quadric_decimation(
-                face_count=configuration.initial_face_count
-            )
-    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
         raise ValueError("Initial mesh must be a non-empty triangle mesh.")
+    mesh = _resample_to_face_count(mesh, configuration.initial_face_count)
     return normalize_mesh_to_challenge_cylinder(mesh, target_R=cylinder_radius)
 
 

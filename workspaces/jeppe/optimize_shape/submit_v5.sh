@@ -30,29 +30,39 @@ MODEL="${LSB_JOBINDEX:-1}"
 
 echo "Running job ${LSB_JOBID:-?}[${LSB_JOBINDEX:-0}] -> model $MODEL on $(hostname)"
 
-# --phases subsamples the light curves by index (no averaging); drop it to keep
-# every native frame (~841 real intensity, 360 blender) - 841 phases means a
-# ~23.5k-sensor batch scene, far heavier per iteration.
+# Blender (simulated) light curves have 360 native frames, so --phases 360 keeps
+# every frame; it is spelled out to pin the sensor-batch size (360 phases x
+# observers) independently of whatever the dataset ships.
 #
 # The surface material is fixed to hac.mitsuba.scene.DEFAULT_BSDF (roughplastic,
 # mirrors bsdf.json); there is no longer a --bsdf-json option.
 #
-# Strategy: start deliberately coarse (--initial-face-count 250) and let
-# --remesh-level add resolution (Botsch-Kobbelt, ~4x faces per event) only when
-# the optimizer plateaus. Level 4 -> ~64k faces worst case.
+# Strategy: warm-start from the convex (lightcurve-inversion) reconstruction for
+# this model instead of an ellipsoid, but still hold it to the coarse
+# --initial-face-count budget (the convex meshes ship ~3.9k faces and are
+# decimated to 250), then let --remesh-level add resolution (Botsch-Kobbelt, ~4x
+# faces per event) only when the optimizer plateaus. Level 4 -> ~64k faces worst
+# case. The warm start buys the low-frequency shape, not the tessellation.
+#
+# NOTE: --initial-subdivisions only shapes the fallback ellipsoid and is inert
+# while --initial-mesh is set. --initial-face-count applies either way, as does
+# normalization to the challenge cylinder.
 #
 # Every value below is the script default made explicit, except:
-#   MODEL (positional)          from $LSB_JOBINDEX
-#   --data-source real          (default: simulated)
-#   --phases 360                 (default: every native frame)
+#   MODEL (positional)           from $LSB_JOBINDEX
+#   --initial-mesh               convex reconstruction for this model
+#   --phases 360                 (default: every native frame; same thing here)
 #   --initial-face-count 250     (default: 2500)
 #   --remesh-level 4             (default: fixed topology)
 #   --evaluate-reference         added only for models 1-3 (the script rejects
 #                                 it for models 4+); gives the reference-shape
 #                                 forward MSE floor
+CONVEX_DIR=/work3/projects/HAC-DTU/reconstructions/convex/intensity
+
 args=(
     "$MODEL"
-    --data-source real
+    --data-source simulated
+    --initial-mesh "${CONVEX_DIR}/asteroid${MODEL}_simulated_intensity.stl"
     --curve-type intensity
     --variant cuda_ad_mono
     --cuda-device 0
@@ -61,7 +71,7 @@ args=(
     --height 64
     --spp 8
     --spp-grad 8
-    --iterations 300
+    --iterations 1000
     --learning-rate 2e-2
     --large-steps-lambda 25.0
     --seed 0
@@ -88,4 +98,4 @@ uv run python optimize_shape_v5.py "${args[@]}"
 #   --movie-width 512 --movie-height 512 --movie-spp 16 --movie-fps 30
 
 # --output-dir is left unset on purpose: results land in
-#   $WORKSPACE_DIR/optimize_shape_v5/model<N>_real_intensity_<UTC timestamp>/
+#   $WORKSPACE_DIR/optimize_shape_v5/model<N>_simulated_intensity_<UTC timestamp>/
