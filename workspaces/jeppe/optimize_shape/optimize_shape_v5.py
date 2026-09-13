@@ -28,6 +28,7 @@ import trimesh
 
 DataSource = Literal["real", "simulated"]
 CurveType = Literal["intensity", "binary"]
+LearningRateSchedule = Literal["constant", "exponential", "linear"]
 
 INTEGRATOR: dict[str, Any] = {"type": "direct"}
 PROJECTION: Literal["orthographic"] = "orthographic"
@@ -62,6 +63,8 @@ class RunConfiguration:
     spp_grad: int
     iterations: int
     learning_rate: float
+    lr_schedule: LearningRateSchedule
+    lr_final_factor: float
     large_steps_lambda: float
     seed: int
     validation_interval: int
@@ -93,6 +96,20 @@ class RunConfiguration:
     def voxel_metrics_enabled(self) -> bool:
         """Voxel measures need the reference shape, which is public for models 1-3."""
         return self.voxel_metrics and self.model_num <= _KNOWN_SHAPE_MAX_MODEL
+
+    def learning_rate_at(self, iteration: int) -> float:
+        """Scheduled learning rate for 1-based ``iteration``.
+
+        Decays from ``learning_rate`` at the first iteration to
+        ``learning_rate * lr_final_factor`` at the last one. The schedule runs
+        over the whole run and is not reset by remeshing.
+        """
+        if self.lr_schedule == "constant":
+            return self.learning_rate
+        progress = (iteration - 1) / max(self.iterations - 1, 1)
+        if self.lr_schedule == "exponential":
+            return self.learning_rate * self.lr_final_factor**progress
+        return self.learning_rate * (1.0 - (1.0 - self.lr_final_factor) * progress)
 
     @property
     def remesh_enabled(self) -> bool:
@@ -206,6 +223,22 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
     parser.add_argument("--spp-grad", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=2e-2)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "exponential", "linear"),
+        default="constant",
+        help=(
+            "decay the learning rate from --learning-rate to --learning-rate x "
+            "--lr-final-factor over --iterations; exponential is recommended "
+            "(constant relative decay, so late fine-detail stages still move)"
+        ),
+    )
+    parser.add_argument(
+        "--lr-final-factor",
+        type=float,
+        default=0.1,
+        help="final / initial learning rate; ignored for --lr-schedule constant",
+    )
     parser.add_argument("--large-steps-lambda", type=float, default=25.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--validation-interval", type=int, default=10)
@@ -302,6 +335,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
     for name in (
         "learning_rate",
+        "lr_final_factor",
         "large_steps_lambda",
         "reduction_temperature",
         "voxel_pitch_divisor",
@@ -341,6 +375,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfiguration:
         spp_grad=args.spp_grad,
         iterations=args.iterations,
         learning_rate=args.learning_rate,
+        lr_schedule=args.lr_schedule,
+        lr_final_factor=args.lr_final_factor,
         large_steps_lambda=args.large_steps_lambda,
         seed=args.seed,
         validation_interval=args.validation_interval,
@@ -1078,6 +1114,9 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
                 )
             gradient = dr.grad(optimizer["u"])
             _check_finite("Large Steps gradient", gradient)
+            # Set every step: remeshing rebuilds Adam at the base learning rate.
+            learning_rate = configuration.learning_rate_at(iteration)
+            optimizer.set_learning_rate(learning_rate)
             optimizer.step()
 
             training_losses.append(loss_value)
@@ -1086,11 +1125,12 @@ def run(configuration: RunConfiguration) -> dict[str, Any]:
                 "kind": "training",
                 "iteration": iteration,
                 "loss": loss_value,
+                "learning_rate": learning_rate,
             }
             _append_history(history_file, entry)
             print(
                 f"Iteration {iteration:04d}/{configuration.iterations}: "
-                f"training_loss={loss_value:.8f}"
+                f"training_loss={loss_value:.8f}, lr={learning_rate:.3g}"
             )
 
             should_validate = (

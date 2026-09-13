@@ -1,6 +1,7 @@
 #!/bin/bash
-#BSUB -q c47511
-#BSUB -J dtu-hac-optimize-shape-v5[1-10]
+####BSUB -q c47511
+#BSUB -q gpua100
+#BSUB -J dtu-hac-optimize-shape-v5[4-10]
 #BSUB -n 12
 #BSUB -W 08:00
 #BSUB -R 'span[hosts=1]'
@@ -54,6 +55,8 @@ echo "Running job ${LSB_JOBID:-?}[${LSB_JOBINDEX:-0}] -> model $MODEL on $(hostn
 #   --phases 360                 (default: every native frame; same thing here)
 #   --initial-face-count 250     (default: 2500)
 #   --remesh-level 4             (default: fixed topology)
+#   --lr-schedule exponential    (default: constant; decays LR to 0.1x by the
+#                                 last iteration, see --lr-final-factor)
 #   --evaluate-reference         added only for models 1-3 (the script rejects
 #                                 it for models 4+); gives the reference-shape
 #                                 forward MSE floor
@@ -72,17 +75,19 @@ args=(
     --spp 8
     --spp-grad 8
     --iterations 1000
-    --learning-rate 2e-2
-    --large-steps-lambda 25.0
+    --learning-rate 1e-2
+    --lr-schedule exponential
+    --lr-final-factor 0.1
+    --large-steps-lambda 10.0
     --seed 0
-    --validation-interval 10
+    --validation-interval 50
     --validation-spp 16
     --early-stop-patience 0
     --initial-subdivisions 5
-    --initial-face-count 250
+    --initial-face-count 200
     --checkpoint-interval 25
     --reduction-temperature 0.01
-    --remesh-level 4
+    --remesh-level 1
 )
 if [ "$MODEL" -le 3 ]; then
     args+=(--evaluate-reference)
